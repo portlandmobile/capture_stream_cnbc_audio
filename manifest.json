@@ -1,0 +1,15 @@
+{
+  "name": "capture-stream-cnbc-audio",
+  "version": "1.0.0",
+  "runtime": "node20", 
+  "tools": [
+    {
+      "name": "capture stream cnbc audio",
+      "description": "Capture and analysis the CNBC stock podcast with Jim Crammer",
+      "parameters": {
+        "type": "object",
+        "properties": { "query": { "type": "string" } }
+      }
+    }
+  ]
+}
