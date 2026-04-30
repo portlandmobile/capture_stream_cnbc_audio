@@ -118,6 +118,11 @@ def main():
     content = message.get("content", "")
     reasoning = message.get("reasoning_content", "")
 
+    # Some models (e.g. Qwen3.6) return the actual response in reasoning_content
+    # with an empty content field. Use reasoning_content as the primary output.
+    if not content and reasoning:
+        content = reasoning
+
     if not args.keep_thinking:
         content = strip_thinking(content)
 

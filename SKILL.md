@@ -5,7 +5,7 @@ user-invocable: true
 metadata:
   openclaw:
     requires:
-      bins: [".venv/bin/python3", "qmd"]
+      bins: [".venv/bin/python3"]
 ---
 # Capture CNBC Live Audio & Extract Stock Mentions
 
@@ -17,62 +17,111 @@ Records one hour of CNBC live audio each weekday morning, transcribes it, and ex
 
 ## Trigger
 
-A cron job fires at **6:00 AM PST Monday–Friday** and invokes this skill on the main OpenClaw agent.
+Two cron jobs fire each weekday:
+
+- **Step 0** (6:00 AM Mon–Fri): Starts the recorder and **immediately exits**. Does NOT transcribe, analyze, or deliver.
+- **Step 1–3** (7:10 AM Mon–Fri): Transcribes, analyzes, and delivers results.
+
+> ⚠️ **NEVER read this SKILL.md from a cron job.** The cron payloads have the steps hardcoded. Re-reading this file causes the agent to hallucinate and run steps out of order (e.g., Step 0 running Steps 1–3 too).
+
+## 🔒 Critical Rule: Two-Cron Isolation
+
+This skill uses a **two-cron architecture** to avoid a 60-minute blocking session:
+
+```
+Cron A (6:00 AM) ──► Start recorder (background) ──► EXIT immediately
+Cron B (7:10 AM) ──► Transcribe → Analyze → Deliver
+```
+
+**When invoked as Step 0 (6:00 AM):**
+- Start the recorder and exit. That is the ENTIRE job.
+- Do NOT run Whisper.
+- Do NOT run `llm_analyze.py`.
+- Do NOT send Telegram messages.
+- Do NOT save vault files.
+- Do NOT read this SKILL.md.
+
+**When invoked as Step 1–3 (7:10 AM):**
+- Check if `recordings/YYYY-MM-DD.txt` exists and is non-empty.
+- If yes → skip Whisper (someone already transcribed), go straight to analysis.
+- If no → run Whisper, then analysis, then deliver.
+- Do NOT re-read this SKILL.md.
+
+Violating this separation causes **duplicate transcriptions**, **duplicate reports**, and **hour-long CPU waste**. The transcript file (`recordings/YYYY-MM-DD.txt`) is the lock mechanism — if it exists, transcription is done.
 
 ---
 
 ## Agent Architecture
 
-This skill uses a **two-step pattern** to avoid blocking the main agent for 60 minutes:
+Two isolated cron jobs coordinate the pipeline:
 
 ```
-Main Agent (OpenClaw)
-  │
-  ├─► Step 0: Spawn recorder in background (exec with background=true)
-  │       └─ runs: .venv/bin/python3 start.py
-  │       └─ records for 60 minutes
-  │       └─ saves recordings/YYYY-MM-DD.mp3
-  │       └─ returns immediately to main agent
-  │
-  └─► Waits for recorder to finish (cron/heartbeat notifies)
-        └─ Step 1: Transcribe with Whisper
-        └─ Step 2: Parse transcript
-        └─ Step 3: Present results
+Cron A (6:00 AM)                    Cron B (7:10 AM)
+┌──────────────────────────┐        ┌─────────────────────────────┐
+│ 1. cd to skill dir       │        │ 1. Check recordings/        │
+│ 2. start.py (background) │        │    YYYY-MM-DD.txt exists?   │
+│ 3. EXIT                  │        │    Yes → skip to Step 2     │
+└──────────────────────────┘        │    No  → run Whisper        │
+             │                      └──────────┬──────────────────┘
+             ▼                                 ▼
+      60 min recording                      2. llm_analyze.py
+      recordings/YYYY-MM-DD.mp3             3. Format summary
+                                             4. Save to vault
+                                             5. Send to Telegram
 ```
 
 ---
 
 ## Step 0 — Start the Recorder
 
-When this skill is triggered, the main agent starts the recorder as a background process:
+**Invoke: Cron A at 6:00 AM Mon–Fri**
 
-```
-exec: .venv/bin/python3 start.py
-background: true
-```
-
-The recorder runs headless, opens CNBC's live audio stream, and captures 60 minutes of audio to `recordings/YYYY-MM-DD.mp3`. The command returns immediately; the recording continues in the background.
-
-> **Note:** The recorder uses Playwright (Chromium). Ensure the machine is running and network-accessible when the cron fires. The browser runs with `headless=False` in the script — if headless mode is needed for your environment, change the launch args accordingly.
-
----
-
-## Step 1 — Transcribe with Whisper
-
-Confirm the MP3 path, then transcribe:
+When this cron triggers, run EXACTLY these commands and then STOP:
 
 ```bash
 cd /home/openclaw/.openclaw/skills/capture_stream_cnbc_audio
-whisper recordings/YYYY-MM-DD.mp3 \
-    --model medium \
-    --language en \
-    --output_format txt \
-    --output_dir recordings/
+.venv/bin/python3 start.py
 ```
 
-Replace `YYYY-MM-DD` with today's date. The transcript will be saved as `recordings/YYYY-MM-DD.txt`.
+Run with `background: true` and `yieldMs: 10000` so it returns immediately.
 
-> Whisper is installed system-wide at `/home/openclaw/.local/bin/whisper`. If you want a larger model, install it with `.venv/bin/pip install openai-whisper` and use `.venv/bin/python3 -m whisper` instead.
+**Then report the PID and exit.** That is your entire job. The recorder continues in the background for 60 minutes.
+
+> **Note:** The recorder uses Playwright (Chromium). Ensure the machine is running and network-accessible when the cron fires. The browser runs with `headless=False` in the script — if headless mode is needed for your environment, change the launch args accordingly.
+
+> **DO NOT proceed to Steps 1–3.** They are handled by the separate 7:10 AM cron.
+
+> **DO NOT re-read this SKILL.md.** The cron payload already specifies what to do.
+
+---
+
+## Step 1 — Transcribe with Whisper-ctranslate2
+
+**Invoke: Cron B at 7:10 AM Mon–Fri**
+
+**FIRST, check the transcript lock:**
+```bash
+ls -la /home/openclaw/.openclaw/skills/capture_stream_cnbc_audio/recordings/$(date +%Y-%m-%d).txt
+```
+
+- If the file exists and is **non-empty** → Whisper already ran. **Skip to Step 2.**
+- If the file does **not exist** or is **empty** → run Whisper:
+
+```bash
+cd /home/openclaw/.openclaw/skills/capture_stream_cnbc_audio
+sleep 30
+whisper-ctranslate2 recordings/YYYY-MM-DD.mp3 \
+  --model medium \
+  --language en \
+  --output_format txt \
+  --output_dir analysis/ \
+  --device cpu \
+  --compute_type int8
+```
+
+Replace `YYYY-MM-DD` with today's date. The transcript will be saved as `recordings/YYYY-MM-DD.md`.  Replace the file extension from .txt to .md if needed.
+
+> Whisper is installed system-wide at `/home/openclaw/.local/bin/whisper-ctranslate2`.
 
 ---
 
@@ -86,43 +135,61 @@ Replace `YYYY-MM-DD` with today's date. The transcript will be saved as `recordi
 
 ## Step 3 — Present the Results
 
-Output a clean, deduplicated summary in this format from `'analysis/YYYY-MM-DD-analysis.md'`:
+Read the parsed analysis from `'analysis/YYYY-MM-DD-analysis.md'` and output a clean, categorized summary.
+
+**Group stocks by sentiment** (bullish, bearish, neutral/analyst). For each stock, show:
+- Bold ticker with company name in parentheses
+- Sentiment label + context tags (earnings, analyst, news, M&A, etc.)
+- One representative quote in a blockquote
+
+Then add a **key themes** section at the bottom — a short paragraph of the biggest narratives, not just a dry count.
+
+**Example output format:**
 
 ```
-CNBC Morning Audio — YYYY-MM-DD
+CNBC Morning Audio — 2026-04-29
 ================================
 
-STOCKS MENTIONED
-----------------
+**BULLISH**
 
-$AAPL  (Apple) — bullish, analyst
-  > "Dan Ives raised his price target on Apple to $275, calling it a top pick..."
+- **$V** (Visa) — earnings, 17% rev gain, 20% EPS beat
+- **$STX** (Seagate) — earnings, data center demand
+- **$GLW** (Corning) — earnings, data center/fiber play
+- **$BE** (Bloom Energy) — news, clean energy
+- **$NXPI** (NXP Semi) — earnings, auto sector strength
+- **$ETSY** (Etsy) — earnings, consumer resilience
+- **$TMUS** (T-Mobile) — earnings, +217K wireless additions
+- **$SBUX** (Starbucks) — analyst, raised full-year outlook, beat streak
 
-$TSLA  (Tesla) — bearish, earnings
-  > "Tesla missed on both the top and bottom line, shares are down pre-market..."
+**BEARISH**
 
-$NVDA  (Nvidia) — bullish, macro
-  > "Nvidia continues to benefit from AI infrastructure spending..."
+- **$GEHC** (GE Healthcare) — earnings miss
+- **$HOOD** (Robinhood) — EPS miss, crypto drag
+- **$BF.B** (Brown Forman) — M&A fallout (Pernod Ricard walked away)
 
-... (continue for all tickers)
+**NEUTRAL / ANALYST FOCUS**
 
-SUMMARY
--------
-Total stocks mentioned : N
-Bullish mentions       : N
-Bearish mentions       : N
-Earnings discussed     : N
+- **$AAPL** (Apple) — earnings signal to watch
+- **$AMZN / $GOOG / $META** (Amazon, Alphabet, Meta) — MAG-7 earnings tonight
+- **$CHTR / $CMCSA / $T** (Charter, Comcast, AT&T) — fixed wireless competition
+- **$PSUS** (Pershing Square USA) — Bill Ackman IPO
 ```
 
-If a ticker is mentioned multiple times with different contexts, merge all contexts into one entry with the most representative quote.
+No blockquotes. One-line concise summaries next to each ticker. Keep it tight.
 
-The output of the summary will be saved as `/home/openclaw/MyVault/Projects/Trading/CNBC_Analysis/YYYY-MM-DD.txt`.
+**Rules:**
+- If a ticker is mentioned multiple times with different contexts, merge into one entry with the most representative quote
+- Use `**` for bold ticker headers, `>` for quotes, `---` separator before SUMMARY
+- Keep it readable — no markdown tables
+- Always end with a key themes paragraph (1-2 sentences) that captures the day's narrative
 
-Then send the summary to the **Daily Briefing channel** on Telegram:
-- **channel:** `telegram`
-- **target:** `-1003815784979`
-
-Use bold for ticker headers, blockquotes (`>`) for quotes, and a `---` separator before the SUMMARY section. Keep it readable — no markdown tables. Include a note at the bottom: `*(Test run — format & flow verified ✅)*` for testing, but remove that note in production cron runs. Use the `message` tool with `action=send`.
+**Save & Deliver:**
+1. Save the summary to `/home/openclaw/MyVault/Projects/Trading/CNBC_Analysis/YYYY-MM-DD.md`
+2. Send it to the **Daily Briefing channel** via Telegram:
+   - **channel:** `telegram`
+   - **target:** `-1003815784979`
+   - Use the `message` tool with `action=send`
+- Include a note at the bottom for testing runs: `*(Test run — format & flow verified ✅)*`, but remove it for production cron deliveries.
 
 ---
 
@@ -174,3 +241,5 @@ cd /home/openclaw/.openclaw/skills/capture_stream_cnbc_audio
 | Whisper runs out of memory | Model too large for available RAM | Switch `--model medium` → `--model small` or use `.venv/bin/python3 -m whisper` with a smaller model if you installed the venv version |
 | Cron job never fires | DISPLAY not set for headless browser | Ensure `DISPLAY=:0` or a virtual framebuffer (Xvfb) is configured in the cron environment |
 | Background agent never reports back | start.py hung or crashed silently | Check `recordings/` for a partial MP3; kill any lingering ffmpeg/chromium processes |
+| Duplicate Whisper processes running | Step 0 cron ran Steps 1–3, then Step 1–3 cron also transcribed | Check if `recordings/YYYY-MM-DD.txt` exists before starting transcription. Kill duplicate `whisper-ctranslate2` processes. Verify cron payloads match the latest SKILL.md. |
+| Two identical reports delivered to Telegram | Step 0 cron completed full pipeline, then Step 1–3 cron also delivered | The transcript file lock (`recordings/YYYY-MM-DD.txt`) prevents re-transcription. If you see duplicates, the lock was bypassed — check the cron payloads and ensure they don't re-read SKILL.md. |
