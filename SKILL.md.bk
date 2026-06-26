@@ -27,8 +27,8 @@ A cron job fires at **6:00 AM PST Monday–Friday**. It runs the entire pipeline
 Step 1: Start recorder (start.py, background) → polls until ~60 min recording finishes
 Step 2: Transcribe with Whisper-ctranslate2 (CPU, ~5-10 min)
 Step 3: LLM analysis with llm_analyze.py (~5 min)
-Step 4: Format with format_report.py + save + Telegram (~2 min)
-Total: ~70 minutes
+Step 4: Format summary, save to vault, send to Telegram
+Total: ~75 minutes
 ```
 
 ---
@@ -71,58 +71,68 @@ Replace `YYYY-MM-DD` with today's date. The transcript will be saved as `recordi
 ## Step 3 — LLM Analysis
 
 ```bash
-.venv/bin/python3 llm_analyze.py 'recordings/YYYY-MM-DD.txt' --output 'analysis/YYYY-MM-DD-analysis.md'
+.venv/bin/python3 llm_analyze.py 'recordings/YYYY-MM-DD.txt' --keep-thinking --output 'analysis/YYYY-MM-DD-analysis.md'
 ```
 
-**Do NOT use `--keep-thinking`** — it causes the model to output reasoning text instead of the required JSON, breaking downstream parsing. The model will produce clean JSON output without thinking mode.
+This sends the transcript to the local llama.cpp server and extracts stock mentions with sentiment analysis.
 
 ---
 
-## Step 4 — Format & Deliver
+## Step 4 — Present the Results
 
-**CRITICAL: Do NOT re-run the local LLM on the analysis file.** The analysis from Step 3 is already structured JSON. Use the formatting script — no additional LLM calls needed.
+Read the parsed analysis from `'analysis/YYYY-MM-DD-analysis.md'` and output a clean, categorized summary.
 
-### 4a. Run the formatting script
+**Group stocks by sentiment** (bullish, bearish, neutral/analyst). For each stock, show:
+- Bold ticker with company name in parentheses
+- Sentiment label + context tags (earnings, analyst, news, M&A, etc.)
+- One representative quote in a blockquote
 
-```bash
-cd /home/openclaw/.openclaw/skills/capture_stream_cnbc_audio
-.venv/bin/python3 format_report.py YYYY-MM-DD --output YYYY-MM-DD-report.md
+Then add a **key themes** section at the bottom — a short paragraph of the biggest narratives, not just a dry count.
+
+**Example output format:**
+
 ```
-
-This reads `analysis/YYYY-MM-DD-analysis.md`, parses the JSON, groups by sentiment (BULLISH/BEARISH/NEUTRAL), and writes a clean markdown report to `YYYY-MM-DD-report.md`.
-
-The output format:
-```
-CNBC Morning Audio — YYYY-MM-DD
+CNBC Morning Audio — 2026-04-29
 ================================
 
 **BULLISH**
 
-- **$TICKER** (Company) — tag1, tag2
-  One-line summary
+- **$V** (Visa) — earnings, 17% rev gain, 20% EPS beat
+- **$STX** (Seagate) — earnings, data center demand
+- **$GLW** (Corning) — earnings, data center/fiber play
+- **$BE** (Bloom Energy) — news, clean energy
+- **$NXPI** (NXP Semi) — earnings, auto sector strength
+- **$ETSY** (Etsy) — earnings, consumer resilience
+- **$TMUS** (T-Mobile) — earnings, +217K wireless additions
+- **$SBUX** (Starbucks) — analyst, raised full-year outlook, beat streak
 
 **BEARISH**
 
-- **$TICKER** (Company) — tag1, tag2
-  One-line summary
+- **$GEHC** (GE Healthcare) — earnings miss
+- **$HOOD** (Robinhood) — EPS miss, crypto drag
+- **$BF.B** (Brown Forman) — M&A fallout (Pernod Ricard walked away)
 
 **NEUTRAL / ANALYST FOCUS**
 
-- **$TICKER** (Company) — tag1, tag2
-  One-line summary
-
----
-
-**Key Themes:** Bullish/Bearish/Mixed sentiment. Top mentions: $T1, $T2, $T3.
+- **$AAPL** (Apple) — earnings signal to watch
+- **$AMZN / $GOOG / $META** (Amazon, Alphabet, Meta) — MAG-7 earnings tonight
+- **$CHTR / $CMCSA / $T** (Charter, Comcast, AT&T) — fixed wireless competition
+- **$PSUS** (Pershing Square USA) — Bill Ackman IPO
 ```
 
-### 4b. Save & Deliver
+No blockquotes. One-line concise summaries next to each ticker. Keep it tight.
 
-1. Read the generated report from `YYYY-MM-DD-report.md`
-2. Save it to `/home/openclaw/MyVault/Projects/Trading/CNBC_Analysis/YYYY-MM-DD.md`
-3. Send it to the **R-P Investment Group** via Telegram:
+**Rules:**
+- If a ticker is mentioned multiple times with different contexts, merge into one entry with the most representative quote
+- Use `**` for bold ticker headers, `>` for quotes, `---` separator before SUMMARY
+- Keep it readable — no markdown tables
+- Always end with a key themes paragraph (1-2 sentences) that captures the day's narrative
+
+**Save & Deliver:**
+1. Save the summary to `/home/openclaw/MyVault/Projects/Trading/CNBC_Analysis/YYYY-MM-DD.md`
+2. Send it to the **Daily Briefing channel** via Telegram:
    - **channel:** `telegram`
-   - **target:** `-1003675085814`
+   - **target:** `-1003815784979`
    - Use the `message` tool with `action=send`
 - Include a note at the bottom for testing runs: `*(Test run — format & flow verified ✅)*`, but remove it for production cron deliveries.
 
@@ -137,7 +147,6 @@ capture_stream_cnbc_audio/
 ├── capture.py            ← audio-only capture helper
 ├── inspect_player.py     ← dev utility for inspecting the player
 ├── llm_analyze.py        ← transcript analysis (calls local llama.cpp)
-├── format_report.py      ← format JSON analysis into Telegram report
 ├── recordings/
 │   ├── YYYY-MM-DD.mp3    ← raw audio
 │   └── YYYY-MM-DD.txt    ← Whisper transcript

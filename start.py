@@ -48,7 +48,9 @@ def capture_stream_url() -> tuple[str | None, dict]:
             if captured_url:
                 return
             url = request.url
-            if ".m3u8" in url and not any(skip in url for skip in SKIP_URL_FRAGMENTS):
+            # Catch both .m3u8 (HLS) and .mp3 (direct stream) URLs from TuneIn/CDN
+            is_stream = (".m3u8" in url or ".mp3" in url) and not any(skip in url for skip in SKIP_URL_FRAGMENTS)
+            if is_stream:
                 captured_url = url
                 try:
                     captured_headers = {

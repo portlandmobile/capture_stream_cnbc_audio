@@ -1,151 +1,135 @@
 #!/usr/bin/env python3
+"""Analyze a CNBC transcript via the local llama.cpp server.
+
+Usage:
+    python llm_analyze.py <transcript_path> [--keep-thinking] [--output <path>]
 """
-Analyze a CNBC transcript for stock mentions using local llama.cpp server.
-Mirrors the web UI prompt and sampling parameters for rich, detailed output.
-"""
-import re
-import sys
-import os
+
 import argparse
-import requests
-from datetime import date
+import json
+import sys
+import urllib.request
+import urllib.error
 
-PROMPT_TEMPLATE = """\
-Attached is the transcript of a stock & ecomonic analysis podcast.
-Read the transcript and extract:
+LLAMA_URL = "http://localhost:8080/v1/chat/completions"
 
-- **Ticker symbols** — E.g. any word matching `$AAPL`, `AAPL`, or spoken as "Apple stock", "shares of Apple", etc.
-- **Company names** and their corresponding tickers
-- **Context around each mention** — classify each as one or more of:
-  - `bullish` — positive outlook, buy recommendation, price target raised, beat earnings
-  - `bearish` — negative outlook, sell recommendation, price target cut, missed earnings
-  - `earnings` — quarterly results discussed
-  - `M&A` — merger, acquisition, or takeover mentioned
-  - `analyst` — analyst rating or price target change
-  - `news` — general news item with no clear directional sentiment
-- **Economic News** 
-  - `macro` — mentioned in context of broad market/economic discussion
+PROMPT = """You are a financial sentiment analyst. Analyze this CNBC audio transcript and extract every stock ticker and company mentioned.
 
-The transcript contains advertisement. Do not output companies or info related to the ad mention.  Otherwise, capture the verbatim sentence(s) around each mention as a short quote for reference.
+For each mention, provide:
+1. The ticker symbol (if identifiable) and company name
+2. Sentiment: BULLISH, BEARISH, or NEUTRAL
+3. Context tags: earnings, analyst_upgrade, analyst_downgrade, news, M&A, capex, guidance, insider_trading, macro, sector_rotation, etc.
+4. A brief summary (one line)
+5. A representative quote from the transcript
 
----
+Format the output as a JSON array of objects with these fields:
+- ticker: string (e.g., "NVDA", "TSLA", or null if no ticker)
+- company: string (company name)
+- sentiment: "BULLISH" | "BEARISH" | "NEUTRAL"
+- tags: array of context tags
+- summary: string (one-line summary)
+- quote: string (representative quote from transcript)
 
-{transcript}"""
+Rules:
+- Group multiple mentions of the same ticker/company into a single entry
+- If a ticker is mentioned with mixed sentiment, use the predominant sentiment and note both in summary
+- Include ALL tickers mentioned, even if briefly
+- Be thorough — don't miss any tickers
+- For companies without a clear ticker, use the company name as the identifier
+- Return ONLY valid JSON. No markdown, no explanation, no additional text. Start with [ and end with ]."""
 
 
-def strip_thinking(text: str) -> str:
-    """Remove <think>...</think> blocks emitted by reasoning models."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+def send_to_llama(transcript_text, keep_thinking=False):
+    """Send transcript to local llama.cpp server and return the response."""
+    messages = [
+        {"role": "system", "content": PROMPT},
+        {"role": "user", "content": transcript_text},
+    ]
+
+##### These are included in the payload.  Leaving them here for reference
+#        "model": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+#        "temperature": 0.1,
+#        "max_tokens": 8192,
+    payload = {
+        "messages": messages,
+        "stream": False,
+        "model": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "temperature": 0.5,
+        "max_tokens": 10240,
+    }
+
+    # Note: thinking mode causes the model to output reasoning text but
+    # not the actual JSON response. For structured output, disable thinking.
+    # If keep_thinking is requested, use it but the output may be reasoning-only.
+    if keep_thinking:
+        # Disable thinking for reliable JSON output
+        payload["thinking"] = False
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        LLAMA_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            message = result["choices"][0]["message"]
+            # Prefer content; fall back to reasoning_content if thinking was used
+            content = message.get("content", "")
+            if not content:
+                content = message.get("reasoning_content", "")
+            return content
+    except urllib.error.URLError as e:
+        print(f"ERROR: Could not connect to llama server at {LLAMA_URL}: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Extract stock mentions from a CNBC transcript via local llama.cpp."
-    )
-    parser.add_argument("file_path", help="Path to the transcript .txt file")
-    parser.add_argument(
-        "--url",
-        default="http://127.0.0.1:8080/v1/chat/completions",
-        help="llama.cpp server endpoint (default: http://127.0.0.1:8080/v1/chat/completions)",
-    )
-    parser.add_argument(
-        "--temperature", type=float, default=1.0,
-        help="Sampling temperature — web UI default is 1.0 (default: 1.0)",
-    )
-    parser.add_argument(
-        "--max-tokens", type=int, default=8192,
-        help="Max tokens to generate (default: 8192)",
-    )
-    parser.add_argument(
-        "--output", default=None,
-        help="Output file path (default: report_YYYY-MM-DD.md beside the transcript)",
-    )
-    parser.add_argument(
-        "--keep-thinking", action="store_true",
-        help="Keep <think> blocks in output instead of stripping them",
-    )
+    parser = argparse.ArgumentParser(description="Analyze CNBC transcript with local LLM")
+    parser.add_argument("transcript_path", help="Path to the transcript .txt file")
+    parser.add_argument("--keep-thinking", action="store_true", help="Enable thinking mode")
+    parser.add_argument("--output", help="Output analysis file path", default=None)
     args = parser.parse_args()
 
-    if not os.path.exists(args.file_path):
-        print(f"Error: file not found: {args.file_path}", file=sys.stderr)
-        sys.exit(1)
-
-    with open(args.file_path, encoding="utf-8") as f:
+    # Read transcript
+    with open(args.transcript_path, "r", encoding="utf-8") as f:
         transcript = f.read()
 
-    prompt = PROMPT_TEMPLATE.format(transcript=transcript)
+    print(f"Transcript loaded: {len(transcript)} chars, {len(transcript.splitlines())} lines")
 
-    # Sampling parameters that match the llama.cpp web UI defaults.
-    # Key differences vs the old scripts:
-    #   - /v1/chat/completions applies the model's chat template (not raw /completion)
-    #   - no stop tokens — let the model finish naturally
-    #   - no JSON coercion — natural markdown output
-    #   - temperature 1.0 / top_p 0.95 / min_p 0.05 match web UI defaults
-    payload = {
-        "model": "local",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": args.temperature,
-        "top_p": 0.95,
-        "top_k": 40,
-        "min_p": 0.05,
-        "repeat_penalty": 1.1,
-        "n_predict": args.max_tokens,
-        "cache_prompt": True,
-        "reasoning_format": "auto",
-        "stream": False,
-    }
+    # Send to LLM
+    print("Sending to local LLM for analysis...")
+    result = send_to_llama(transcript, keep_thinking=args.keep_thinking)
 
-    print(f"Sending {len(transcript):,} chars to {args.url}")
-    print(f"temperature={args.temperature}  top_p=0.95  top_k=40  min_p=0.05  max_tokens={args.max_tokens}")
+    # Clean up the result (remove markdown code blocks if present)
+    result = result.strip()
+    if result.startswith("```json"):
+        result = result[7:]
+    if result.startswith("```"):
+        result = result[3:]
+    if result.endswith("```"):
+        result = result[:-3]
+    result = result.strip()
 
-    try:
-        resp = requests.post(args.url, json=payload, timeout=600)
-        resp.raise_for_status()
-    except requests.exceptions.ConnectionError:
-        print(f"Cannot connect to llama.cpp at {args.url}", file=sys.stderr)
-        print("Is the server running?  llama-server -m model.gguf --port 8080", file=sys.stderr)
-        sys.exit(1)
-    except requests.exceptions.Timeout:
-        print("Request timed out after 10 min. Try a shorter transcript.", file=sys.stderr)
-        sys.exit(1)
-    except requests.exceptions.HTTPError as e:
-        print(f"HTTP error: {e}", file=sys.stderr)
-        print(resp.text[:500], file=sys.stderr)
-        sys.exit(1)
-
-    data = resp.json()
-    message = data["choices"][0]["message"]
-    content = message.get("content", "")
-    reasoning = message.get("reasoning_content", "")
-
-    # Some models (e.g. Qwen3.6) return the actual response in reasoning_content
-    # with an empty content field. Use reasoning_content as the primary output.
-    if not content and reasoning:
-        content = reasoning
-
-    if not args.keep_thinking:
-        content = strip_thinking(content)
-
-    # Default output path: same directory as the transcript, named by today's date
-    if args.output:
-        output_path = args.output
-    else:
-        transcript_dir = os.path.dirname(os.path.abspath(args.file_path))
-        output_path = os.path.join(transcript_dir, f"report_{date.today()}.md")
+    # Write output
+    output_path = args.output
+    if not output_path:
+        # Derive from transcript path
+        import os
+        base = os.path.splitext(args.transcript_path)[0]
+        output_path = base + "-analysis.md"
 
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(result)
 
-    print(f"\n✅  Saved to: {output_path}")
-    print(f"    Response: {len(content):,} chars", end="")
-    if reasoning:
-        print(f"   |  Thinking (stripped): {len(reasoning):,} chars", end="")
-    print()
-    print("\n" + "─" * 70)
-    preview = content[:3000]
-    print(preview)
-    if len(content) > 3000:
-        print(f"\n… ({len(content) - 3000:,} more chars — see {output_path})")
+    print(f"Analysis saved to: {output_path}")
+    print(f"Output size: {len(result)} chars")
 
 
 if __name__ == "__main__":
