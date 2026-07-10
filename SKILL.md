@@ -66,6 +66,8 @@ Replace `YYYY-MM-DD` with today's date. The transcript will be saved as `recordi
 
 > Whisper is installed system-wide at `/home/openclaw/.local/bin/whisper-ctranslate2`.
 
+> **IMPORTANT:** After Step 2 completes, verify the file exists with `ls -la recordings/YYYY-MM-DD.txt`. **Do NOT read or display the transcript content** — it is 40–60KB and loading it into your context will slow the entire session significantly.
+
 ---
 
 ## Step 3 — LLM Analysis
@@ -75,6 +77,8 @@ Replace `YYYY-MM-DD` with today's date. The transcript will be saved as `recordi
 ```
 
 **Do NOT use `--keep-thinking`** — it causes the model to output reasoning text instead of the required JSON, breaking downstream parsing. The model will produce clean JSON output without thinking mode.
+
+> **IMPORTANT:** Run this as a plain exec call. Do NOT read the transcript file before or after this step — `llm_analyze.py` handles all file I/O internally. After it completes, verify with `ls -la analysis/YYYY-MM-DD-analysis.md` only.
 
 ---
 

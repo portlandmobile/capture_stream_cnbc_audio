@@ -39,31 +39,34 @@ Rules:
 - Return ONLY valid JSON. No markdown, no explanation, no additional text. Start with [ and end with ]."""
 
 
+MAX_TRANSCRIPT_CHARS = 60000  # ~15K tokens; enough for a full hour of CNBC
+
+
 def send_to_llama(transcript_text, keep_thinking=False):
     """Send transcript to local llama.cpp server and return the response."""
+    # Truncate to avoid slow prefill on very large transcripts (57KB+ seen in practice)
+    if len(transcript_text) > MAX_TRANSCRIPT_CHARS:
+        print(f"Transcript truncated from {len(transcript_text)} to {MAX_TRANSCRIPT_CHARS} chars for LLM prefill speed")
+        transcript_text = transcript_text[:MAX_TRANSCRIPT_CHARS]
+
+    # /no_think in the user message is the most reliable way to suppress Qwen3 thinking
+    # at the chat-template level, regardless of llama.cpp version.
+    user_content = f"/no_think\n\n{transcript_text}"
+
     messages = [
         {"role": "system", "content": PROMPT},
-        {"role": "user", "content": transcript_text},
+        {"role": "user", "content": user_content},
     ]
 
-##### These are included in the payload.  Leaving them here for reference
-#        "model": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
-#        "temperature": 0.1,
-#        "max_tokens": 8192,
     payload = {
         "messages": messages,
         "stream": False,
-        "model": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
-        "temperature": 0.5,
-        "max_tokens": 10240,
+        "temperature": 0.1,
+        "max_tokens": 8192,
+        # Belt-and-suspenders: also disable via API field and chat_template_kwargs
+        "thinking": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
-
-    # Note: thinking mode causes the model to output reasoning text but
-    # not the actual JSON response. For structured output, disable thinking.
-    # If keep_thinking is requested, use it but the output may be reasoning-only.
-    if keep_thinking:
-        # Disable thinking for reliable JSON output
-        payload["thinking"] = False
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
