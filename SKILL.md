@@ -40,7 +40,11 @@ cd /home/openclaw/.openclaw/skills/capture_stream_cnbc_audio
 .venv/bin/python3 start.py
 ```
 
-Run with `background: true` and `yieldMs: 10000` so it returns immediately, then poll until the process completes (~60 min).
+**IMPORTANT:** Run this with `background: true`, `yieldMs: 10000`, and `timeout: 3600`.
+
+Then poll using `process(action="poll", sessionId=<session-name>, timeout=600000)` every ~2-3 minutes until the MP3 output file appears in `recordings/`. Use `ls -la recordings/*.mp3*` to check periodically.
+
+The recording is done when the `.tmp` file disappears and the final `.mp3` exists with a stable size (~50-60 MB).
 
 > **Note:** The recorder uses Playwright (Chromium). Ensure the machine is running and network-accessible when the cron fires. The browser runs with `headless=False` in the script — if headless mode is needed for your environment, change the launch args accordingly.
 
@@ -48,11 +52,10 @@ Run with `background: true` and `yieldMs: 10000` so it returns immediately, then
 
 ## Step 2 — Transcribe with Whisper-ctranslate2
 
-**Wait 30 seconds** after the recording finishes (ffmpeg may still be closing the file).
+**Wait 30 seconds** after the recording finishes (ffmpeg may still be closing the file). Check that the `.mp3` exists and has a stable size before starting.
 
 ```bash
 cd /home/openclaw/.openclaw/skills/capture_stream_cnbc_audio
-sleep 30
 whisper-ctranslate2 recordings/YYYY-MM-DD.mp3 \
   --model medium \
   --language en \
@@ -62,23 +65,42 @@ whisper-ctranslate2 recordings/YYYY-MM-DD.mp3 \
   --compute_type int8
 ```
 
+**IMPORTANT — Do NOT include `sleep 30` in the exec command.** Instead, do a `ls -la recordings/YYYY-MM-DD.mp3` first, wait 30 seconds in your turn (or use `process` to poll), then fire the whisper command.
+
+**CRITICAL EXECUTION RULES:**
+
+1. **ALWAYS use `background: true`** — never fire whisper synchronously. Long-running processes will be killed if the agent's turn ends mid-execution.
+2. Set `timeout: 900` (15 min) and `yieldMs: 15000` on the exec call.
+3. After starting, **poll with `process(action="poll", sessionId=<name>, timeout=600000)`** until the process exits.
+4. When polling returns `exitCode` is non-`None` or says `Process exited`, verify the output file:
+   ```bash
+   ls -la recordings/YYYY-MM-DD.txt && wc -l recordings/YYYY-MM-DD.txt
+   ```
+5. **Do NOT re-run whisper unless you see a real failure** (exit code, explicit error, or the file genuinely doesn't exist after the process exited). Each re-run overwrites the output file and wastes time.
+6. If the transcript file already exists with 800+ lines, the job is done — move on to Step 3.
+
 Replace `YYYY-MM-DD` with today's date. The transcript will be saved as `recordings/YYYY-MM-DD.txt`.
 
 > Whisper is installed system-wide at `/home/openclaw/.local/bin/whisper-ctranslate2`.
 
-> **IMPORTANT:** After Step 2 completes, verify the file exists with `ls -la recordings/YYYY-MM-DD.txt`. **Do NOT read or display the transcript content** — it is 40–60KB and loading it into your context will slow the entire session significantly.
+> **IMPORTANT:** After Step 2 completes, verify the file exists with `ls -la recordings/YYYY-MM-DD.txt` and line count. **Do NOT read or display the transcript content** — it is 40–60KB and loading it into your context will slow the entire session significantly.
 
 ---
 
 ## Step 3 — LLM Analysis
 
 ```bash
+cd /home/openclaw/.openclaw/skills/capture_stream_cnbc_audio
 .venv/bin/python3 llm_analyze.py 'recordings/YYYY-MM-DD.txt' --output 'analysis/YYYY-MM-DD-analysis.md'
 ```
 
 **Do NOT use `--keep-thinking`** — it causes the model to output reasoning text instead of the required JSON, breaking downstream parsing. The model will produce clean JSON output without thinking mode.
 
-> **IMPORTANT:** Run this as a plain exec call. Do NOT read the transcript file before or after this step — `llm_analyze.py` handles all file I/O internally. After it completes, verify with `ls -la analysis/YYYY-MM-DD-analysis.md` only.
+**IMPORTANT:** Run this with `background: true`, `yieldMs: 30000`, and `timeout: 900`.
+
+Then poll with `process(action="poll", sessionId=<name>, timeout=600000)` until it exits. After completion, verify with `ls -la analysis/YYYY-MM-DD-analysis.md` only.
+
+> **IMPORTANT:** Do NOT read the transcript file before or after this step — `llm_analyze.py` handles all file I/O internally.
 
 ---
 
@@ -181,3 +203,4 @@ cd /home/openclaw/.openclaw/skills/capture_stream_cnbc_audio
 | Whisper runs out of memory | Model too large for available RAM | Switch `--model medium` → `--model small` or use `.venv/bin/python3 -m whisper` with a smaller model if you installed the venv version |
 | Cron job never fires | DISPLAY not set for headless browser | Ensure `DISPLAY=:0` or a virtual framebuffer (Xvfb) is configured in the cron environment |
 | Background agent never reports back | start.py hung or crashed silently | Check `recordings/` for a partial MP3; kill any lingering ffmpeg/chromium processes |
+| Whisper re-run kills transcript | Agent fired whisper without `background:true` | The skill now enforces background execution. Old runs may have orphaned whisper processes — check with `ps aux | grep whisper-ctranslate2` and kill any orphans before next run |

@@ -11,7 +11,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 URL = "https://www.cnbc.com/live-audio/"
-RECORDINGS_DIR = Path("/home/openclaw/.openclaw/skills/capture_stream_cnbc_audio/recordings")
+RECORDINGS_DIR = Path("/home/openclaw/.openclaw-next/skills/capture_stream_cnbc_audio/recordings")
 DURATION_SECONDS = 60 * 60
 BITRATE = "128k"
 
